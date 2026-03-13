@@ -7,8 +7,6 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Instrument+Serif&display=swap" rel="stylesheet" />
-  <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" async></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <style>
     :root {
       --bg: #0a0a0a;
@@ -214,6 +212,19 @@
       <p class="footer">We only read your recently played tracks. You can disconnect at any time.</p>
     </div>
   </div>
+
+  <!-- Load Supabase first -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+
+  <!-- Load MusicKit with the musickitloaded event listener -->
+  <script>
+    document.addEventListener('musickitloaded', function() {
+      console.log('MusicKit JS loaded and ready');
+      window._musicKitReady = true;
+    });
+  </script>
+  <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" crossorigin></script>
+
   <script>
     (function() {
       var SUPA_URL = 'https://pslwpsasjbaznhjqhowq.supabase.co';
@@ -230,6 +241,7 @@
       function showStatus(type, message) {
         statusEl.className = 'status ' + type;
         statusEl.textContent = message;
+        console.log('[Status ' + type + ']', message);
       }
 
       function setLoading(on) {
@@ -242,24 +254,55 @@
         }
       }
 
+      // Wait for MusicKit to be ready, with timeout
+      function waitForMusicKit(timeout) {
+        return new Promise(function(resolve, reject) {
+          if (window.MusicKit) {
+            resolve();
+            return;
+          }
+          var waited = 0;
+          var interval = setInterval(function() {
+            waited += 200;
+            if (window.MusicKit) {
+              clearInterval(interval);
+              resolve();
+            } else if (waited >= timeout) {
+              clearInterval(interval);
+              reject(new Error('MusicKit JS failed to load. Check your internet connection and try again.'));
+            }
+          }, 200);
+        });
+      }
+
       async function checkAuth() {
-        var result = await sb.auth.getSession();
-        currentSession = result.data.session;
-        if (!currentSession) {
-          connectBtn.style.display = 'none';
-          authPrompt.style.display = 'block';
-        } else {
-          connectBtn.style.display = 'block';
-          authPrompt.style.display = 'none';
+        try {
+          var result = await sb.auth.getSession();
+          currentSession = result.data.session;
+          console.log('[Auth] Session:', currentSession ? 'signed in as ' + (currentSession.user.email || currentSession.user.id) : 'not signed in');
+          if (!currentSession) {
+            connectBtn.style.display = 'none';
+            authPrompt.style.display = 'block';
+          } else {
+            connectBtn.style.display = 'block';
+            authPrompt.style.display = 'none';
+          }
+        } catch (err) {
+          console.error('[Auth] Error checking session:', err);
         }
       }
 
       signinBtn.addEventListener('click', async function() {
+        console.log('[Auth] Starting Apple sign in...');
         var result = await sb.auth.signInWithOAuth({ provider: 'apple' });
-        if (result.error) showStatus('error', result.error.message);
+        if (result.error) {
+          console.error('[Auth] Sign in error:', result.error);
+          showStatus('error', result.error.message);
+        }
       });
 
       sb.auth.onAuthStateChange(function(event, session) {
+        console.log('[Auth] State changed:', event);
         currentSession = session;
         if (session) {
           connectBtn.style.display = 'block';
@@ -274,9 +317,18 @@
         }
 
         setLoading(true);
-        showStatus('info', 'Fetching developer token...');
 
         try {
+          // Step 1: Wait for MusicKit JS to be loaded
+          showStatus('info', 'Loading MusicKit...');
+          console.log('[MusicKit] Waiting for MusicKit JS...');
+          await waitForMusicKit(15000);
+          console.log('[MusicKit] MusicKit JS is ready');
+
+          // Step 2: Get developer token from edge function
+          showStatus('info', 'Fetching developer token...');
+          console.log('[Token] Calling apple-music-dev-token...');
+
           var dtRes = await fetch(SUPA_URL + '/functions/v1/apple-music-dev-token', {
             headers: {
               'Authorization': 'Bearer ' + currentSession.access_token,
@@ -284,15 +336,27 @@
             }
           });
 
+          console.log('[Token] Response status:', dtRes.status);
+
           if (!dtRes.ok) {
-            var dtErr = await dtRes.json();
-            throw new Error(dtErr.error || 'Failed to get developer token');
+            var dtErrText = await dtRes.text();
+            console.error('[Token] Error response:', dtErrText);
+            try {
+              var dtErr = JSON.parse(dtErrText);
+              throw new Error(dtErr.error || 'Developer token failed (status ' + dtRes.status + ')');
+            } catch (e) {
+              if (e.message.indexOf('Developer token') !== -1) throw e;
+              throw new Error('Developer token failed (status ' + dtRes.status + '): ' + dtErrText);
+            }
           }
 
           var dtData = await dtRes.json();
           var devToken = dtData.token;
+          console.log('[Token] Got developer token, length:', devToken.length);
 
-          showStatus('info', 'Opening Apple Music...');
+          // Step 3: Configure MusicKit
+          showStatus('info', 'Configuring MusicKit...');
+          console.log('[MusicKit] Configuring...');
 
           await MusicKit.configure({
             developerToken: devToken,
@@ -300,16 +364,21 @@
           });
 
           var music = MusicKit.getInstance();
+          console.log('[MusicKit] Instance ready, requesting authorization...');
 
+          // Step 4: Authorize — this opens the Apple Music permission popup
           showStatus('info', 'Requesting Apple Music access...');
 
           var musicUserToken = await music.authorize();
+          console.log('[MusicKit] Got user token, length:', musicUserToken ? musicUserToken.length : 0);
 
           if (!musicUserToken) {
             throw new Error('Authorization was cancelled');
           }
 
+          // Step 5: Save the token
           showStatus('info', 'Saving connection...');
+          console.log('[Save] Calling save-apple-music-token...');
 
           var saveRes = await fetch(SUPA_URL + '/functions/v1/save-apple-music-token', {
             method: 'POST',
@@ -321,17 +390,27 @@
             body: JSON.stringify({ music_user_token: musicUserToken })
           });
 
+          console.log('[Save] Response status:', saveRes.status);
+
           if (!saveRes.ok) {
-            var saveErr = await saveRes.json();
-            throw new Error(saveErr.error || 'Failed to save token');
+            var saveErrText = await saveRes.text();
+            console.error('[Save] Error response:', saveErrText);
+            try {
+              var saveErr = JSON.parse(saveErrText);
+              throw new Error(saveErr.error || 'Failed to save token');
+            } catch (e) {
+              if (e.message.indexOf('save') !== -1 || e.message.indexOf('Failed') !== -1) throw e;
+              throw new Error('Failed to save token: ' + saveErrText);
+            }
           }
 
+          console.log('[Done] Apple Music connected successfully!');
           connectBtn.style.display = 'none';
           connectedBadge.style.display = 'flex';
           showStatus('success', 'Apple Music connected! Your listening history will start syncing shortly.');
 
         } catch (err) {
-          console.error('Connect error:', err);
+          console.error('[Error]', err);
           if (err.message && (err.message.indexOf('cancelled') !== -1 || err.message.indexOf('denied') !== -1)) {
             showStatus('error', 'Authorization was cancelled. Try again when ready.');
           } else {
